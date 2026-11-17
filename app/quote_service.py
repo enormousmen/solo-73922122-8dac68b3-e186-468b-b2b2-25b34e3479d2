@@ -14,6 +14,8 @@
 - diff=1                影子端制造可比对的差异 (主端忽略)
 - size=<字节>           /quote-big 的响应大小 (默认 33554432 = 32MiB)
 - chunk_ms=<毫秒>       /quote-big 每块之间的延迟, 便于观察流式行为
+- abort_after=<字节>    /quote-big 发出指定字节后中断连接 (模拟断流)
+- s_abort_after=<字节>  仅影子端断流; p_abort_after 仅主端断流
 """
 from __future__ import annotations
 
@@ -112,18 +114,29 @@ async def quote_big(request: Request):
         })
 
     shadow_diff = ROLE == "shadow" and q.get("diff") == "1"
+    # abort_after 对两端生效; p_abort_after / s_abort_after 只对对应端生效
+    abort_after = int(q.get("abort_after", "0"))
+    abort_after += int(q.get(f"{'p' if ROLE == 'primary' else 's'}_abort_after", "0"))
 
     async def gen():
         if delay:
             await asyncio.sleep(delay)
         remaining = size
         index = 0
+        sent = 0
         while remaining > 0:
             n = min(BIG_CHUNK, remaining)
             block = _deterministic_block(index, n)
             if shadow_diff and index == 0:
                 block = b"X" + block[1:]  # 首字节差异, 摘要必然不同
+            if abort_after and sent + n > abort_after:
+                # 只发出部分块后中断: 客户端会看到不完整的响应流
+                partial = max(0, abort_after - sent)
+                if partial:
+                    yield block[:partial]
+                raise ConnectionResetError("simulated upstream stream abort")
             yield block
+            sent += n
             remaining -= n
             index += 1
             if chunk_ms:
